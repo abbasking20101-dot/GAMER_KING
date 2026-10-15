@@ -2929,9 +2929,16 @@ const firebaseConfig = {
     };
 
 
+
 window.executePurchase = async function() {
     const checkout = window.currentCheckout || {};
-    const price = checkout.finalPrice || 50;
+    
+    // 100% डिस्काउंट या फ्री होने पर प्राइस 0 सेट करें
+    let price = typeof checkout.finalPrice !== 'undefined' ? parseFloat(checkout.finalPrice) : 50;
+    if (checkout.couponApplied && price <= 0) {
+        price = 0;
+    }
+
     const btn = document.getElementById('btn-confirm-pay');
     
     let balance = 0;
@@ -2941,8 +2948,34 @@ window.executePurchase = async function() {
         balance = 2650;
     }
 
-    if (balance < price) {
+    if (price > 0 && balance < price) {
         return showToast(`Insufficient balance. Need ₹${price.toFixed(2)}`, "error");
+    }
+
+    // 🛑 **कूपन लिमिट और वैलिडिटी की सख्त जाँच (Server Validation)**
+    if (checkout.couponApplied && checkout.couponCode) {
+        const couponCodeClean = checkout.couponCode.trim().toUpperCase();
+        try {
+            let couponSnap;
+            if (typeof db !== 'undefined' && typeof db.ref === 'function') {
+                couponSnap = await db.ref(`coupons/${couponCodeClean}`).once('value');
+            }
+            
+            if (couponSnap && couponSnap.exists()) {
+                let cData = couponSnap.val();
+                let usedCount = parseInt(cData.usedCount || cData.usage || 0);
+                let maxUsage = parseInt(cData.maxUsage || 1);
+
+                // अगर कूपन पहले ही लिमिट पार कर चुका है या एक्सपायर्ड है
+                if (cData.status === "EXPIRED" || usedCount >= maxUsage) {
+                    return showToast("❌ This coupon has already reached its usage limit and is now expired!", "error");
+                }
+            } else {
+                return showToast("❌ Invalid or deleted coupon code!", "error");
+            }
+        } catch (err) {
+            console.error("Coupon verification error:", err);
+        }
     }
 
     showLoader();
@@ -3000,25 +3033,28 @@ window.executePurchase = async function() {
             return showToast(`All keys in [${poolLabel}] pool are sold out!`, "error");
         }
 
-        let committed = false;
-        if (typeof currentUser !== 'undefined' && currentUser && currentUser.uid) {
-            if (typeof runTransaction !== 'undefined' && typeof ref !== 'undefined') {
-                const res = await runTransaction(ref(db, `users/${currentUser.uid}/balance`), (bal) => {
-                    if (bal === null) return 0;
-                    if (bal >= price) return bal - price;
-                    return undefined;
-                });
-                committed = res.committed;
-            } else if (typeof db !== 'undefined' && typeof db.ref === 'function') {
-                const res = await db.ref(`users/${currentUser.uid}/balance`).transaction((bal) => {
-                    if (bal === null) return 0;
-                    if (bal >= price) return bal - price;
-                    return undefined;
-                });
-                committed = res.committed;
+        let committed = true;
+        if (price > 0) {
+            committed = false;
+            if (typeof currentUser !== 'undefined' && currentUser && currentUser.uid) {
+                if (typeof runTransaction !== 'undefined' && typeof ref !== 'undefined') {
+                    const res = await runTransaction(ref(db, `users/${currentUser.uid}/balance`), (bal) => {
+                        if (bal === null) return 0;
+                        if (bal >= price) return bal - price;
+                        return undefined;
+                    });
+                    committed = res.committed;
+                } else if (typeof db !== 'undefined' && typeof db.ref === 'function') {
+                    const res = await db.ref(`users/${currentUser.uid}/balance`).transaction((bal) => {
+                        if (bal === null) return 0;
+                        if (bal >= price) return bal - price;
+                        return undefined;
+                    });
+                    committed = res.committed;
+                }
+            } else {
+                committed = true;
             }
-        } else {
-            committed = true;
         }
 
         if (committed) {
@@ -3033,6 +3069,7 @@ window.executePurchase = async function() {
                 plan: planText,
                 label: availableKeyObj.note || planText,
                 price: price,
+                couponUsed: checkout.couponCode || (price === 0 ? "100%_DISCOUNT" : "None"),
                 key: assignedKey,
                 link: checkout.link || '',
                 date: nowIso
@@ -3041,10 +3078,12 @@ window.executePurchase = async function() {
             if (typeof db !== 'undefined' && typeof db.ref === 'function') {
                 if (uId !== "guest_user") {
                     await db.ref(`purchases/${uId}`).push(userPurchaseData);
-                    await db.ref(`transactions/${uId}/${txId}`).set({
-                        id: txId, type: "purchase", amount: price, status: "success",
-                        desc: `Purchased ${packName}`, date: nowIso
-                    });
+                    if (price > 0) {
+                        await db.ref(`transactions/${uId}/${txId}`).set({
+                            id: txId, type: "purchase", amount: price, status: "success",
+                            desc: `Purchased ${packName}`, date: nowIso
+                        });
+                    }
                 }
                 await db.ref(`${targetNode}/${availableKeyId}`).update({
                     uid: uId,
@@ -3053,15 +3092,41 @@ window.executePurchase = async function() {
             } else {
                 if (uId !== "guest_user") {
                     await set(push(ref(db, `purchases/${uId}`)), userPurchaseData);
-                    await set(ref(db, `transactions/${uId}/${txId}`), {
-                        id: txId, type: "purchase", amount: price, status: "success",
-                        desc: `Purchased ${packName}`, date: nowIso
-                    });
+                    if (price > 0) {
+                        await set(ref(db, `transactions/${uId}/${txId}`), {
+                            id: txId, type: "purchase", amount: price, status: "success",
+                            desc: `Purchased ${packName}`, date: nowIso
+                        });
+                    }
                 }
                 await update(ref(db, `${targetNode}/${availableKeyId}`), {
                     uid: uId,
                     assigned_at: nowIso
                 });
+            }
+
+            // 🛠️ **कूपन के इस्तेमाल होते ही उसे हमेशा के लिए बंद (EXPIRED) करने का कोड**
+            if (checkout.couponCode) {
+                const couponCodeClean = checkout.couponCode.trim().toUpperCase();
+                try {
+                    if (typeof db !== 'undefined' && typeof db.ref === 'function') {
+                        const couponRef = db.ref(`coupons/${couponCodeClean}`);
+                        const snap = await couponRef.once('value');
+                        if (snap.exists()) {
+                            let cData = snap.val();
+                            let currentUsage = parseInt(cData.usedCount || cData.usage || 0) + 1;
+                            let maxUsage = parseInt(cData.maxUsage || 1);
+                            
+                            await couponRef.update({
+                                usedCount: currentUsage,
+                                usage: `${currentUsage}/${maxUsage}`,
+                                status: currentUsage >= maxUsage ? "EXPIRED" : "ACTIVE"
+                            });
+                        }
+                    }
+                } catch (err) {
+                    console.log("Coupon usage update error:", err);
+                }
             }
 
             closeModal('modal-checkout');
@@ -3082,6 +3147,8 @@ window.executePurchase = async function() {
         btn.innerHTML = `Confirm Pay`;
     }
 };
+
+
 
 
 
